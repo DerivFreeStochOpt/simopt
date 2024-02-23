@@ -961,7 +961,13 @@ class Experiment(tk.Toplevel):
                 self.solver_name = self.selected[1]
                 self.problem_name = self.selected[0]
 
-                
+                def problem_solver_unabbreviated_to_object(problem_or_solver,unabbreviated_dictionary):
+                    if problem_or_solver in unabbreviated_dictionary.keys():
+                        problem_or_solver_object = unabbreviated_dictionary[problem_or_solver]
+                        return problem_or_solver_object, problem_or_solver_object().name
+                    else:
+                        print(f"{problem_or_solver} not found in {unabbreviated_dictionary}")
+                        return None, None
                 
                 solver_object,self.solver_name = problem_solver_unabbreviated_to_object(self.solver_name,solver_unabbreviated_directory)
                 problem_object, self.problem_name = problem_solver_unabbreviated_to_object(self.problem_name,problem_unabbreviated_directory)
@@ -1107,14 +1113,6 @@ class Experiment(tk.Toplevel):
 
             message = "You have not selected all required fields, check for '*' near input boxes."
             tk.messagebox.showerror(title="Error Window", message=message)
-            
-        def problem_solver_unabbreviated_to_object(problem_or_solver,unabbreviated_dictionary):
-            if problem_or_solver in unabbreviated_dictionary.keys():
-                problem_or_solver_object = unabbreviated_dictionary[problem_or_solver]
-                return problem_or_solver_object, problem_or_solver_object().name
-            else:
-                print(f"{problem_or_solver} not found in {unabbreviated_dictionary}")
-                return None, None
 
     def confirm_problem_factors(self):
         self.problem_factors_return = []
