@@ -10,7 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
-from scipy.stats import norm, linregress
+from scipy.stats import norm
 import pickle
 import importlib
 import time
@@ -19,10 +19,9 @@ from mrg32k3a.mrg32k3a import MRG32k3a
 import multiprocessing
 from multiprocessing import Process
 
-
-from .base import Solution
-from .directory import solver_directory, problem_directory
-
+from simopt.base import Solution
+from simopt.directory import solver_directory, problem_directory
+from simopt.windows.status_window import Status_Window
 
 class Curve(object):
     """Base class for all curves.
@@ -400,6 +399,10 @@ class ProblemSolver(object):
         else:
             self.file_name_path = file_name_path
 
+        # Set default tuning variables
+        self.CPU_count_limit = 4
+        self.active_thread_limit = 10 # Set to big number to allow for all threads to run at once
+
     def check_compatibility(self):
         """Check whether the experiment's solver and problem are compatible.
 
@@ -427,41 +430,6 @@ class ProblemSolver(object):
         if self.solver.gradient_needed and not self.problem.gradient_available:
             error_str += "Gradient-based solver does not have access to gradient for this problem.\n"
         return error_str
-    
-    def print_status_bar(self, n_total, n_completed, time_remaining_dict = None, time_remaining_start = None):
-        """Print the current status of the macroreplications.
-        """
-        # Clear the line real fast
-        print("\033[2K\033[1G", end="")
-        # If the bar should be complete, don't even bother printing the bar
-        if n_completed == n_total:
-            return
-        # Construct the string to print
-        status_bar = "["
-        for mrep in range(n_completed):
-            status_bar += "√"
-        for mrep in range(n_completed, n_total):
-            status_bar += "_"
-        status_bar += "]"
-        # Otherwise, calculate out the time remaining using linear regression on the timings
-        if time_remaining_dict is not None and time_remaining_start is not None and len(time_remaining_dict) > 1:
-            # Copy the dictionary
-            time_dict = time_remaining_dict.copy()
-            # Extract the keys and values from the dictionary
-            keys = list(time_dict.keys())
-            values = list(time_dict.values())
-            # Use linear regression to estimate the time remaining
-            slope, intercept, r_value, p_value, std_err = linregress(keys, values)
-            estimated_time_of_last_mrep = slope * n_total + intercept + time_remaining_start
-            time_remaining = estimated_time_of_last_mrep - time.time()
-            # Prevent it from printing negative numbers (that can't be right)
-            if time_remaining < 0:
-                time_remaining = 0
-            # Print out the time remaining (clear to end of line)
-            print(status_bar, "Time remaining: {:.3f} seconds".format(round(time_remaining, 3)), end='\r')
-        # If we can't estimate the time remaining
-        else:
-            print(status_bar, "Time remaining: pending...", end='\r')
 
     def run(self, n_macroreps):
         """Run n_macroreps of the solver on the problem.
@@ -501,23 +469,25 @@ class ProblemSolver(object):
         #     Streams 3, 4, ..., n_macroreps + 2: reserved for
         #                                         macroreplications
         rng0 = MRG32k3a(s_ss_sss_index=[2, 0, 0])  # Currently unused.
-        rng1 = MRG32k3a(s_ss_sss_index=[2, 1, 0])
-        rng2 = MRG32k3a(s_ss_sss_index=[2, 2, 0])
-        rng3 = MRG32k3a(s_ss_sss_index=[2, 3, 0])
-        self.solver.attach_rngs([rng1, rng2, rng3])
+        rng_list = [MRG32k3a(s_ss_sss_index=[2, i+1, 0]) for i in range(3)]
+        self.solver.attach_rngs(rng_list)
 
         self.function_start = time.time()
 
+        # Open the status_bar window
+        status_window = Status_Window(n_macroreps)
+
         # If we're only doing one macroreplication or we have less than 4 cores, run the solver in series
         # It just isn't worth the overhead to run in parallel
-        if n_macroreps == 1 or os.cpu_count is None or (os.cpu_count() is not None and os.cpu_count() < 4): # type:ignore
+        if n_macroreps == 1 or os.cpu_count is None or (os.cpu_count() is not None and os.cpu_count() < self.CPU_count_limit): # type:ignore
             print("Starting macroreplications in series")
             for mrep in range(n_macroreps):
                 self.run_multithread(mrep)
+                # Update the window
+                status_window.update_progress(mrep + 1)
+                status_window.update_time_remaining(self.timings_since_function_start)
         else:
             print("Starting macroreplications in parallel")
-            # Print out an empty bar
-            self.print_status_bar(n_macroreps, 0)
 
             # Run n_macroreps of the solver on the problem.
             # Report recommended solutions and corresponding intermediate budgets.
@@ -525,33 +495,42 @@ class ProblemSolver(object):
             Processes = [Process(target=self.run_multithread, args=(mrep,)) for mrep in range(self.n_macroreps)]
 
             # Start each process.
-            for mrep in range(self.n_macroreps):
+            for mrep in range(n_macroreps):
                 # Only allow for so many processes to be running at once
-                while (mrep - len(self.timings.keys())) >= 10:
+                while (mrep - len(self.timings.keys())) >= self.active_thread_limit:
                     # Print the current status of the macroreplications
-                    self.print_status_bar(n_macroreps, len(self.timings.keys()), self.timings_since_function_start, self.function_start)
-                    # Sleep for 100ms
-                    time.sleep(0.1)
+                    status_window.update_progress(len(self.timings.keys()))
+                    status_window.update_time_remaining(self.timings_since_function_start)
+                    # Sleep for 10ms
+                    time.sleep(0.01)
                 # Start the process
                 Processes[mrep].start()
                 # Print the current status of the macroreplications
-                self.print_status_bar(n_macroreps, len(self.timings.keys()), self.timings_since_function_start, self.function_start)
+                status_window.update_progress(len(self.timings.keys()))
+                status_window.update_time_remaining(self.timings_since_function_start)
 
             # Wait for each process to finish.
             while (True):
                 # Print the current status of the macroreplications
-                self.print_status_bar(n_macroreps, len(self.timings.keys()), self.timings_since_function_start, self.function_start)
+                status_window.update_progress(len(self.timings.keys()))
+                status_window.update_time_remaining(self.timings_since_function_start)
                 # If all the processes are done, break out of the loop
                 if len(self.timings.keys()) == n_macroreps:
                     break
-                # Sleep for 100ms
-                time.sleep(0.1)
+                # Sleep for 10ms
+                time.sleep(0.01)
+            
+            # Make sure to update the status window one last time
+            # Sometimes it misses the prior update (race condition stuff) and
+            # needs to be updated so it can close
+            status_window.update_progress(len(self.timings.keys()))
+            status_window.update_time_remaining(self.timings_since_function_start)
 
             # Join the threads
-            for mrep in range(self.n_macroreps):
+            for mrep in range(n_macroreps):
                 Processes[mrep].join()
             # Stop the threads
-            for mrep in range(self.n_macroreps):
+            for mrep in range(n_macroreps):
                 Processes[mrep].terminate()
 
         # Print the total runtime.
@@ -582,8 +561,6 @@ class ProblemSolver(object):
         # Set progenitor_rngs and rng_list for solver.
         self.solver.solution_progenitor_rngs = progenitor_rngs
         self.solver.rng_list = solver_rngs
-
-        # print("\t{}: Started".format(mrep + 1))
 
         # print([rng.s_ss_sss_index for rng in progenitor_rngs])
         # Run the solver on the problem.
@@ -632,56 +609,124 @@ class ProblemSolver(object):
             True if CRN used for post-replications at solutions recommended on different
             macroreplications, otherwise False.
         """
+        print("\Settup up {} postreplications for {} macroreplications of {} on {}.".format(n_postreps, self.n_macroreps, self.solver.name, self.problem.name))
+        
         self.n_postreps = n_postreps
         self.crn_across_budget = crn_across_budget
         self.crn_across_macroreps = crn_across_macroreps
+
+        # Create variables for anything that changes/updates while being run so
+        # that concurrent access is possible
+        # All of these are dictionaries so that the key (mrep) can be used to
+        # store data in order, and then the data can be later accessed in order
+        multiprocessing_manager = multiprocessing.Manager()
+        self.all_post_replicates = multiprocessing_manager.dict()
+        self.timings = multiprocessing_manager.dict()
+        self.timings_since_function_start = multiprocessing_manager.dict()
+
         # Create, initialize, and attach RNGs for model.
         # Stream 0: reserved for post-replications.
         # Skip over first set of substreams dedicated for sampling x0 and x*.
         baseline_rngs = [MRG32k3a(s_ss_sss_index=[0, self.problem.model.n_rngs + rng_index, 0]) for rng_index in range(self.problem.model.n_rngs)]
-        # Initialize matrix containing
-        #     all postreplicates of objective,
-        #     for each macroreplication,
-        #     for each budget.
-        self.all_post_replicates = [[[] for _ in range(len(self.all_intermediate_budgets[mrep]))] for mrep in range(self.n_macroreps)]
 
-        # Simulate intermediate recommended solutions.
-        macrorep_start_time = time.time()
-        print("Starting postreplicating {} macroreplications of {} on {}.".format(self.n_macroreps, self.solver.name, self.problem.name))
-        mrep_time_dict = {}
-        self.print_status_bar(self.n_macroreps, 0)
-        for mrep in range(self.n_macroreps):
-            for budget_index in range(len(self.all_intermediate_budgets[mrep])):
-                x = self.all_recommended_xs[mrep][budget_index]
-                fresh_soln = Solution(x, self.problem)
-                fresh_soln.attach_rngs(rng_list=baseline_rngs, copy=False)
-                self.problem.simulate(solution=fresh_soln, m=self.n_postreps)
-                # Store results
-                self.all_post_replicates[mrep][budget_index] = list(fresh_soln.objectives[:fresh_soln.n_reps][:, 0])  # 0 <- assuming only one objective
-                if crn_across_budget:
-                    # Reset each rng to start of its current substream.
-                    for rng in baseline_rngs:
-                        rng.reset_substream()
-            if crn_across_macroreps:
-                # Reset each rng to start of its current substream.
-                for rng in baseline_rngs:
-                    rng.reset_substream()
-            else:
-                # Advance each rng to start of
-                #     substream = current substream + # of model RNGs.
-                for rng in baseline_rngs:
-                    for _ in range(self.problem.model.n_rngs):
-                        rng.advance_substream()
-            mrep_time_dict[mrep] = time.time() - macrorep_start_time
-            self.print_status_bar(self.n_macroreps, mrep + 1, mrep_time_dict, macrorep_start_time)
+        self.function_start = time.time()
+
+        # Open the status_bar window
+        status_window = Status_Window(self.n_macroreps)
+
+        # If we're only doing one macroreplication or we have less than 4 cores, run the solver in series
+        # It just isn't worth the overhead to run in parallel
+        if self.n_macroreps == 1 or os.cpu_count is None or (os.cpu_count() is not None and os.cpu_count() < self.CPU_count_limit): # type:ignore
+            print("Starting postreplications in series")
+            for mrep in range(self.n_macroreps):
+                self.post_replicate_multithread(mrep)
+                # Update the window
+                status_window.update_progress(mrep + 1)
+                status_window.update_time_remaining(self.timings_since_function_start)
+        else:
+            print ("Starting postreplications in parallel")
+
+            # Run n_macroreps of the post-replication process
+            Processes = [Process(target=self.post_replicate_multithread, args=(mrep, n_postreps, crn_across_budget, crn_across_macroreps, baseline_rngs, )) for mrep in range(self.n_macroreps)]
+
+            # Start each process
+            for mrep in range(self.n_macroreps):
+                # Only allow for so many processes to be running at once
+                while (mrep - len(self.timings.keys())) >= self.active_thread_limit:
+                    # Print the current status of the macroreplications
+                    status_window.update_progress(len(self.timings.keys()))
+                    status_window.update_time_remaining(self.timings_since_function_start)
+                    # Sleep for 10ms
+                    time.sleep(0.01)
+                # Start the process
+                Processes[mrep].start()
+                # Print the current status of the macroreplications
+                status_window.update_progress(len(self.timings.keys()))
+                status_window.update_time_remaining(self.timings_since_function_start)
+
+            # Wait for each process to finish.
+            while (True):
+                # Print the current status of the macroreplications
+                status_window.update_progress(len(self.timings.keys()))
+                status_window.update_time_remaining(self.timings_since_function_start)
+                # If all the processes are done, break out of the loop
+                if len(self.timings.keys()) == self.n_macroreps:
+                    break
+                # Sleep for 10ms
+                time.sleep(0.01)
+
+            # Join the threads
+            for mrep in range(self.n_macroreps):
+                Processes[mrep].join()
+            # Stop the threads
+            for mrep in range(self.n_macroreps):
+                Processes[mrep].terminate()
+
+        # Print the total runtime.
+        current_time = round(time.time() - self.function_start, 3)
+        print("Finished postreplicating {} macroreplications in {} seconds.".format(self.n_macroreps, current_time))
+
+        # Convert shared memory dictionaries into lists
+        self.timings = [self.timings[i] for i in range(len(self.timings.keys()))]
+        # The all post replicates is tricky because it is a dictionary of lists of lists
+        # We need to convert it to a list of lists of lists
+        self.all_post_replicates = [self.all_post_replicates[i] for i in range(len(self.all_post_replicates.keys()))]
+        # TODO: what I just said
+
         # Store estimated objective for each macrorep for each budget.
         self.all_est_objectives = [[np.mean(self.all_post_replicates[mrep][budget_index]) for budget_index in range(len(self.all_intermediate_budgets[mrep]))] for mrep in range(self.n_macroreps)]
         # Save ProblemSolver object to .pickle file.
         self.record_experiment_results()
 
-        macrorep_end_time = time.time()
-        print("Finished postreplicating {} macroreplications in {:.3f} seconds.".format(self.n_macroreps, macrorep_end_time - macrorep_start_time))
+    def post_replicate_multithread(self, mrep, n_postreps, crn_across_budget, crn_across_macroreps, baseline_rngs):
+        # I have no idea how rng is being handled here
+        
+        # If we don't want the same crn across macroreps,
+        if not crn_across_macroreps:
+            # Advance to the mth substream?
+            for _ in range(mrep):
+                rng.advance_substream()
+        else:
+            # Advance each rng to start of
+            #     substream = current substream + # of model RNGs.
+            for rng in baseline_rngs:
+                for _ in range(self.problem.model.n_rngs):
+                    rng.advance_substream()
 
+        for budget_index in range(len(self.all_intermediate_budgets[mrep])):
+            x = self.all_recommended_xs[mrep][budget_index]
+            fresh_soln = Solution(x, self.problem)
+            # Attach RNGs for postreplications.
+            # If CRN is used across budgets, then we should use a copy rather
+            # than passing in the original RNGs.
+            if (crn_across_budget):
+                fresh_soln.attach_rngs(rng_list=baseline_rngs, copy=True)
+            else:
+                fresh_soln.attach_rngs(rng_list=baseline_rngs, copy=False)
+            self.problem.simulate(solution=fresh_soln, m=self.n_postreps)
+            # Store results
+            self.all_post_replicates[mrep][budget_index] = list(fresh_soln.objectives[:fresh_soln.n_reps][:, 0])  # 0 <- assuming only one objective
+    
     def check_postreplicate(self):
         """Check if the experiment has been postreplicated.
 
